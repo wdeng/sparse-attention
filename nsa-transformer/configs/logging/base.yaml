@@ -1,0 +1,56 @@
+# Weights & Biases configuration
+wandb:
+  project: "nsa-transformer"
+  entity: null  # Your W&B username/organization
+  name: ${name}  # From root config
+  tags: []
+  notes: ""
+  log_interval: 10
+  
+# Tensorboard
+tensorboard:
+  enabled: true
+  log_dir: ${output_dir}/tensorboard
+  
+# Checkpointing
+checkpointing:
+  enabled: true
+  save_steps: 1000
+  save_optimizer: true
+  save_scheduler: true
+  keep_last_k: 5
+  save_best: true
+  metric: "loss"
+  mode: "min"
+  
+# Console logging
+console:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+# File logging
+file:
+  enabled: true
+  level: "DEBUG"
+  filename: ${output_dir}/logs/training.log
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  max_size_mb: 100
+  backup_count: 5
+  
+# Metric tracking
+metrics:
+  train: ["loss", "learning_rate", "grad_norm"]
+  eval: ["loss", "perplexity", "accuracy"]
+  log_predictions: true
+  log_gradients: true
+  log_parameters: true
+  log_memory: true
+  
+# Profiling
+profiling:
+  enabled: false
+  start_step: 100
+  end_step: 200
+  trace_memory: true
+  trace_cuda: true
+  trace_cpu: true 

@@ -1,0 +1,40 @@
+# Model architecture
+_target_: models.transformer.NSATransformer
+
+# Model dimensions
+d_model: 2048
+n_heads: 32
+n_layers: 24
+vocab_size: 128000
+max_position_embeddings: 32768
+
+# NSA attention
+block_size: 16
+compression_stride: 8
+top_blocks: 4
+window_size: 64
+gqa_groups: 4  # Number of groups for grouped query attention
+
+# MoE configuration
+moe_layers: [4, 8, 12, 16, 20]  # Layer indices for MoE
+n_experts: 8
+expert_dim: 8192
+top_k: 2
+capacity_factor: 1.25
+
+# Dropout
+attention_dropout: 0.1
+hidden_dropout: 0.1
+expert_dropout: 0.1
+
+# Activation
+activation: "gelu"
+
+# Initialization
+initializer_range: 0.02
+layer_norm_epsilon: 1e-5
+
+# Positional embeddings
+pos_embedding_type: "rotary"  # [absolute, rotary, alibi]
+rotary_dim: 64  # For rotary embeddings
+max_rotary_freq: 1000000 

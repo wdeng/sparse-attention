@@ -1,0 +1,31 @@
+defaults:
+  - model: base
+  - training: base
+  - data: base
+  - memory: base
+  - logging: base
+  - _self_
+
+# Experiment name
+name: nsa_transformer
+seed: 42
+
+# Output directory
+output_dir: ${hydra:runtime.cwd}/outputs/${name}
+
+# Distributed training
+distributed:
+  backend: nccl
+  find_unused_parameters: false
+  
+# Mixed precision
+mixed_precision:
+  param_dtype: bfloat16
+  reduce_dtype: bfloat16
+  buffer_dtype: bfloat16
+  
+# System
+system:
+  compile: true  # Use torch.compile
+  deterministic: false  # Set for reproducibility
+  benchmark: true  # Set for better performance 

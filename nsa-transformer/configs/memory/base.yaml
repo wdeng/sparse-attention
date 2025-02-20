@@ -1,0 +1,38 @@
+# KV cache configuration
+kv_cache:
+  quantization: "fp8"  # [none, fp8, int8]
+  threshold: 512  # Sequence length threshold for quantization
+  block_size: 16  # Block size for memory coalescing
+  
+# Activation checkpointing
+activation_checkpointing:
+  granularity: "selective"  # [none, full, selective]
+  checkpoint_every_n_layers: 2
+  preserve_rng_state: true
+  
+# Expert offloading (for MoE)
+expert_offloading:
+  enabled: true
+  pin_memory: true
+  prefetch_experts: 2  # Number of experts to prefetch
+  
+# Memory optimizations
+optimizations:
+  use_flash_attention: true
+  use_memory_efficient_attention: true
+  fuse_attention_qkv: true
+  fuse_scale_mask_softmax: true
+  
+# CUDA kernels
+cuda_kernels:
+  enable_hbm_optimizations: true
+  enable_bank_conflict_avoidance: true
+  enable_vectorized_operations: true
+  enable_memory_coalescing: true
+  
+# Memory monitoring
+monitoring:
+  log_memory_usage: true
+  log_peak_memory: true
+  log_memory_traces: false
+  alert_threshold_gb: 40  # Alert if memory usage exceeds this 
