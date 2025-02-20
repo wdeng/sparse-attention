@@ -1,0 +1,33 @@
+# Large model configuration
+defaults:
+  - base
+  - _self_
+
+# Model dimensions
+d_model: 4096
+n_heads: 64
+n_layers: 32
+vocab_size: 256000
+max_position_embeddings: 32768
+
+# NSA attention
+block_size: 32
+compression_stride: 16
+top_blocks: 8
+window_size: 1024
+gqa_groups: 8
+
+# MoE configuration
+moe_layers: [7, 15, 23, 31]  # Every 8th layer
+n_experts: 16
+expert_dim: 16384
+top_k: 4
+capacity_factor: 1.5
+
+# Dropout (increased for larger model)
+attention_dropout: 0.15
+hidden_dropout: 0.15
+expert_dropout: 0.15
+
+# Positional embeddings
+rotary_dim: 128  # Increased for better position encoding 
