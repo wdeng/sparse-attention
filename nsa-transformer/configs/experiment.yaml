@@ -1,0 +1,114 @@
+defaults:
+  - model/architecture
+  - training/optimizer
+  - training/scheduler
+  - _self_
+
+# Model Architecture
+model:
+  vocab_size: 128000  # 128k tokens
+  d_model: 2560
+  n_layers: 30
+  n_heads: 32
+  max_seq_length: 32768  # 32k context
+  dropout: 0.1
+  
+  # NSA-specific parameters
+  block_size: 32
+  compression_stride: 16
+  top_blocks: 16
+  window_size: 512
+  gqa_groups: 4
+  
+  # MoE configuration
+  moe_layers: [5, 11, 17, 23, 29]  # Every 6th layer after layer 5
+  n_experts: 72
+  n_active_experts: 6
+  expert_capacity: 128
+  
+# Training Configuration
+training:
+  batch_size: 512  # Sequences per batch
+  max_tokens: 4194304  # 4M tokens per batch
+  gradient_accumulation_steps: 8
+  max_steps: 400000
+  warmup_steps: 1000
+  
+  # Optimizer
+  optimizer:
+    name: "adamw"
+    lr: 2e-4
+    betas: [0.9, 0.95]
+    eps: 1e-8
+    weight_decay: 0.01
+    
+  # Learning rate schedule
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+    min_lr: 2e-5
+    
+  # Precision and parallelism
+  precision: "bf16"
+  gradient_checkpointing: true
+  zero_stage: 3
+  fsdp_config:
+    sharding_strategy: "full"
+    mixed_precision: true
+    activation_checkpointing: true
+    
+# Data Configuration
+data:
+  train_data:
+    - name: "c4"
+      weight: 0.7
+    - name: "stack"
+      weight: 0.2
+    - name: "github"
+      weight: 0.1
+      
+  sequence_length:
+    train: 8192  # 8k for pretraining
+    eval: 32768  # 32k for evaluation
+    
+  tokenizer:
+    name: "sentencepiece"
+    vocab_size: 128000
+    special_tokens:
+      pad_token: "[PAD]"
+      unk_token: "[UNK]"
+      bos_token: "[BOS]"
+      eos_token: "[EOS]"
+      fill_token: "[FILL]"
+      
+# Logging and Checkpointing
+logging:
+  wandb:
+    project: "nsa-transformer"
+    entity: "research"
+    log_interval: 10
+    
+  checkpointing:
+    save_steps: 1000
+    keep_last_n: 5
+    
+# Hardware Configuration
+hardware:
+  num_gpus: 8
+  gpu_type: "a100"
+  gpu_memory: "80gb"
+  
+# Memory Optimization
+memory:
+  kv_cache:
+    quantization: "fp8"
+    threshold: 16384  # Start quantizing after 16k context
+    
+  activation_checkpointing:
+    granularity: "selective"
+    checkpoint_every_n_layers: 1
+    
+  expert_offloading:
+    enabled: true
+    offload_optimizer: true
+    pin_memory: true 
