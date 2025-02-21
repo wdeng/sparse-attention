@@ -2,7 +2,10 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <nvToolsExt.h>
 
 // Constants for kernel optimization
 constexpr int WARP_SIZE = 32;
@@ -16,6 +19,41 @@ constexpr int BLOCK_SIZE_M = 64;  // Tensor Core friendly sizes
 constexpr int BLOCK_SIZE_N = 64;
 constexpr int BLOCK_SIZE_K = 8;
 constexpr int MEMORY_ALIGNMENT = 128;  // 128-byte alignment for HBM efficiency
+
+// Mixed precision type handling
+template<typename T>
+struct TypeInfo {
+    static constexpr bool is_fp16 = false;
+    static constexpr bool is_bf16 = false;
+    static constexpr bool is_fp32 = false;
+};
+
+template<>
+struct TypeInfo<half> {
+    static constexpr bool is_fp16 = true;
+};
+
+template<>
+struct TypeInfo<nv_bfloat16> {
+    static constexpr bool is_bf16 = true;
+};
+
+template<>
+struct TypeInfo<float> {
+    static constexpr bool is_fp32 = true;
+};
+
+// Profiling utilities
+struct ScopedNvtxRange {
+    ScopedNvtxRange(const char* name) {
+        nvtxRangePushA(name);
+    }
+    ~ScopedNvtxRange() {
+        nvtxRangePop();
+    }
+};
+
+#define PROFILE_KERNEL(name) ScopedNvtxRange _nvtx_range(name)
 
 // Memory access patterns for HBM optimization
 template<typename T>
@@ -41,17 +79,24 @@ inline dim3 get_block_dim(int block_size) {
     return dim3(min(warps_per_block * WARP_SIZE, MAX_THREADS_PER_BLOCK));
 }
 
-// Shared memory utilities with bank conflict avoidance and tensor core alignment
+// Shared memory utilities with mixed precision support
 template<typename T>
 struct SharedMemory {
     __device__ inline T* get() {
         extern __shared__ unsigned char memory[] __align__(MEMORY_ALIGNMENT);
-        // Add padding to avoid bank conflicts
-        return reinterpret_cast<T*>(memory) + threadIdx.x % (HBM_BANK_SIZE / sizeof(T));
+        if constexpr (TypeInfo<T>::is_fp16 || TypeInfo<T>::is_bf16) {
+            // Add extra padding for half precision types
+            return reinterpret_cast<T*>(memory) + 
+                   (threadIdx.x % (HBM_BANK_SIZE / sizeof(T))) + 
+                   (HBM_BANK_SIZE / sizeof(T));  // Extra padding for bank conflicts
+        } else {
+            return reinterpret_cast<T*>(memory) + 
+                   threadIdx.x % (HBM_BANK_SIZE / sizeof(T));
+        }
     }
 };
 
-// Optimized memory loading with vectorized access and tensor core alignment
+// Optimized memory loading with vectorized access and mixed precision support
 template<typename scalar_t>
 __device__ inline void load_to_shared_memory_vectorized(
     scalar_t* shared_dest,
@@ -60,24 +105,48 @@ __device__ inline void load_to_shared_memory_vectorized(
     int stride,
     int size
 ) {
-    using Vec4 = typename std::aligned_storage<sizeof(scalar_t[4]), alignof(scalar_t[4])>::type;
-    const Vec4* src_vec4 = reinterpret_cast<const Vec4*>(
-        reinterpret_cast<const char*>(global_src + offset) + 
-        (threadIdx.x * MEMORY_ALIGNMENT) % (HBM_BANK_SIZE * sizeof(scalar_t))
-    );
-    Vec4* dest_vec4 = reinterpret_cast<Vec4*>(
-        reinterpret_cast<char*>(shared_dest) + 
-        (threadIdx.x * MEMORY_ALIGNMENT) % (HBM_BANK_SIZE * sizeof(scalar_t))
-    );
-    
-    #pragma unroll
-    for (int i = 0; i < size / 4; i++) {
-        dest_vec4[i] = src_vec4[i * stride / 4];
-    }
-    
-    // Handle remaining elements with aligned access
-    for (int i = (size / 4) * 4; i < size; i++) {
-        shared_dest[i] = global_src[offset + i * stride];
+    if constexpr (TypeInfo<scalar_t>::is_fp16 || TypeInfo<scalar_t>::is_bf16) {
+        // Use vectorized loads for half precision
+        using Vec2 = typename std::aligned_storage<sizeof(scalar_t[2]), alignof(scalar_t[2])>::type;
+        const Vec2* src_vec2 = reinterpret_cast<const Vec2*>(
+            reinterpret_cast<const char*>(global_src + offset) + 
+            (threadIdx.x * MEMORY_ALIGNMENT) % (HBM_BANK_SIZE * sizeof(scalar_t))
+        );
+        Vec2* dest_vec2 = reinterpret_cast<Vec2*>(
+            reinterpret_cast<char*>(shared_dest) + 
+            (threadIdx.x * MEMORY_ALIGNMENT) % (HBM_BANK_SIZE * sizeof(scalar_t))
+        );
+        
+        #pragma unroll
+        for (int i = 0; i < size / 2; i++) {
+            dest_vec2[i] = src_vec2[i * stride / 2];
+        }
+        
+        // Handle remaining elements
+        if (size % 2) {
+            shared_dest[size - 1] = global_src[offset + (size - 1) * stride];
+        }
+    } else {
+        // Use float4 for full precision
+        using Vec4 = typename std::aligned_storage<sizeof(scalar_t[4]), alignof(scalar_t[4])>::type;
+        const Vec4* src_vec4 = reinterpret_cast<const Vec4*>(
+            reinterpret_cast<const char*>(global_src + offset) + 
+            (threadIdx.x * MEMORY_ALIGNMENT) % (HBM_BANK_SIZE * sizeof(scalar_t))
+        );
+        Vec4* dest_vec4 = reinterpret_cast<Vec4*>(
+            reinterpret_cast<char*>(shared_dest) + 
+            (threadIdx.x * MEMORY_ALIGNMENT) % (HBM_BANK_SIZE * sizeof(scalar_t))
+        );
+        
+        #pragma unroll
+        for (int i = 0; i < size / 4; i++) {
+            dest_vec4[i] = src_vec4[i * stride / 4];
+        }
+        
+        // Handle remaining elements
+        for (int i = (size / 4) * 4; i < size; i++) {
+            shared_dest[i] = global_src[offset + i * stride];
+        }
     }
 }
 

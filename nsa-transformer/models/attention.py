@@ -19,12 +19,32 @@ class CompressionMLP(nn.Module):
         self.layer2 = nn.Linear(4 * d_model, d_model)
         self.act = nn.GELU()
         
+        # Add positional embeddings
+        self.pos_emb = nn.Parameter(torch.randn(1, 1, block_size, d_model))
+        
+        # Add dtype tracking for mixed precision
+        self.register_buffer('_dummy', torch.empty(0), persistent=False)
+        
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dummy.dtype
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch, blocks, block_size, d_model]
         batch, blocks, block_size, d_model = x.shape
-        x = x.reshape(batch, blocks, -1)  # [batch, blocks, block_size * d_model]
-        x = self.act(self.layer1(x))
-        x = self.layer2(x)  # [batch, blocks, d_model]
+        
+        # Handle mixed precision
+        comp_dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else x.dtype
+        x = x.to(comp_dtype)
+        
+        # Add positional embeddings
+        x = x + self.pos_emb.to(comp_dtype)
+        
+        with torch.cuda.amp.autocast(enabled=True):
+            x = x.reshape(batch, blocks, -1)  # [batch, blocks, block_size * d_model]
+            x = self.act(self.layer1(x))
+            x = self.layer2(x)  # [batch, blocks, d_model]
+            
         return x
 
 class NSAttention(nn.Module):
@@ -80,6 +100,13 @@ class NSAttention(nn.Module):
             self.register_buffer('k_scale', torch.ones(1))
             self.register_buffer('v_scale', torch.ones(1))
             
+        # Add dtype tracking for mixed precision
+        self.register_buffer('_dummy', torch.empty(0), persistent=False)
+        
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dummy.dtype
+        
     def _reshape_heads(self, x: torch.Tensor, is_key_value: bool = False) -> torch.Tensor:
         batch, seq_len, _ = x.shape
         if is_key_value:
@@ -230,35 +257,43 @@ class NSAttention(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_length, _ = hidden_states.shape
         
-        # Use automatic mixed precision
+        # Cast to computation dtype (typically float16 or bfloat16 in mixed precision)
+        comp_dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else hidden_states.dtype
+        hidden_states = hidden_states.to(comp_dtype)
+        
+        # Use automatic mixed precision context
         with torch.cuda.amp.autocast(enabled=True):
             # Project queries, keys, and values
             q = self._reshape_heads(self.q_proj(hidden_states))
             k = self._reshape_heads(self.k_proj(hidden_states), is_key_value=True)
             v = self._reshape_heads(self.v_proj(hidden_states), is_key_value=True)
             
-            # Quantize KV cache if enabled
-            k, v = self._quantize_kv(k, v)
+            # Quantize KV cache if enabled (using fp8 for compression path)
+            if self.use_fp8_kv_cache and self.training:
+                k, v = self._quantize_kv(k, v)
             
             # Use gradient checkpointing for memory efficiency
             if self.gradient_checkpointing and self.training:
                 compression_out = torch.utils.checkpoint.checkpoint(
-                    self._compression_branch, q, k, v, attention_mask
+                    self._compression_branch, q, k, v, attention_mask,
+                    use_reentrant=False  # More memory efficient
                 )
                 selection_out = torch.utils.checkpoint.checkpoint(
-                    self._selection_branch, q, k, v, attention_mask
+                    self._selection_branch, q, k, v, attention_mask,
+                    use_reentrant=False
                 )
                 window_out = torch.utils.checkpoint.checkpoint(
-                    self._window_branch, q, k, v, attention_mask
+                    self._window_branch, q, k, v, attention_mask,
+                    use_reentrant=False
                 )
             else:
                 compression_out = self._compression_branch(q, k, v, attention_mask)
                 selection_out = self._selection_branch(q, k, v, attention_mask)
                 window_out = self._window_branch(q, k, v, attention_mask)
             
-            # Compute gating weights
-            gates = self.gate_mlp(hidden_states)  # [batch, seq, 3]
-            g_cmp, g_slc, g_win = gates.chunk(3, dim=-1)
+            # Compute gating weights with input in original precision
+            gates = self.gate_mlp(hidden_states.to(self.dtype))  # [batch, seq, 3]
+            g_cmp, g_slc, g_win = gates.to(comp_dtype).chunk(3, dim=-1)
             
             # Combine branch outputs with gating
             combined = (
@@ -271,4 +306,5 @@ class NSAttention(nn.Module):
             combined = combined.transpose(1, 2).contiguous()
             combined = combined.view(batch_size, seq_length, self.d_model)
             
+            # Final output projection
             return self.o_proj(combined) 
