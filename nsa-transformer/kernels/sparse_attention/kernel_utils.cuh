@@ -11,9 +11,15 @@ constexpr int MAX_SHARED_MEMORY = 48 * 1024;  // 48KB shared memory per block
 constexpr int L2_CACHE_LINE_SIZE = 128;       // L2 cache line size for coalescing
 constexpr int HBM_BANK_SIZE = 256;            // HBM bank size for bank conflict avoidance
 
+// Tensor Core optimization constants
+constexpr int BLOCK_SIZE_M = 64;  // Tensor Core friendly sizes
+constexpr int BLOCK_SIZE_N = 64;
+constexpr int BLOCK_SIZE_K = 8;
+constexpr int MEMORY_ALIGNMENT = 128;  // 128-byte alignment for HBM efficiency
+
 // Memory access patterns for HBM optimization
 template<typename T>
-struct alignas(HBM_BANK_SIZE) HBMAlignedBuffer {
+struct alignas(MEMORY_ALIGNMENT) HBMAlignedBuffer {
     T data[HBM_BANK_SIZE / sizeof(T)];
 };
 
@@ -22,30 +28,30 @@ inline int ceil_div(int x, int y) {
     return (x + y - 1) / y;
 }
 
-// Compute optimal grid dimensions for sparse attention
+// Compute optimal grid dimensions for sparse attention with tensor core alignment
 inline dim3 get_grid_dim(int batch_size, int num_heads, int seq_length, int block_size) {
-    const int blocks_per_sequence = ceil_div(seq_length, block_size);
+    const int blocks_per_sequence = ceil_div(seq_length, BLOCK_SIZE_M);
     return dim3(batch_size, num_heads, blocks_per_sequence);
 }
 
-// Compute optimal block dimensions with warp alignment
+// Compute optimal block dimensions with warp and tensor core alignment
 inline dim3 get_block_dim(int block_size) {
-    // Round up to nearest warp size for coalesced memory access
+    // Round up to nearest warp size and ensure tensor core compatibility
     const int warps_per_block = ceil_div(block_size, WARP_SIZE);
     return dim3(min(warps_per_block * WARP_SIZE, MAX_THREADS_PER_BLOCK));
 }
 
-// Shared memory utilities with bank conflict avoidance
+// Shared memory utilities with bank conflict avoidance and tensor core alignment
 template<typename T>
 struct SharedMemory {
     __device__ inline T* get() {
-        extern __shared__ unsigned char memory[];
+        extern __shared__ unsigned char memory[] __align__(MEMORY_ALIGNMENT);
         // Add padding to avoid bank conflicts
         return reinterpret_cast<T*>(memory) + threadIdx.x % (HBM_BANK_SIZE / sizeof(T));
     }
 };
 
-// Optimized memory loading with vectorized access
+// Optimized memory loading with vectorized access and tensor core alignment
 template<typename scalar_t>
 __device__ inline void load_to_shared_memory_vectorized(
     scalar_t* shared_dest,
@@ -55,17 +61,57 @@ __device__ inline void load_to_shared_memory_vectorized(
     int size
 ) {
     using Vec4 = typename std::aligned_storage<sizeof(scalar_t[4]), alignof(scalar_t[4])>::type;
-    const Vec4* src_vec4 = reinterpret_cast<const Vec4*>(global_src + offset);
-    Vec4* dest_vec4 = reinterpret_cast<Vec4*>(shared_dest);
+    const Vec4* src_vec4 = reinterpret_cast<const Vec4*>(
+        reinterpret_cast<const char*>(global_src + offset) + 
+        (threadIdx.x * MEMORY_ALIGNMENT) % (HBM_BANK_SIZE * sizeof(scalar_t))
+    );
+    Vec4* dest_vec4 = reinterpret_cast<Vec4*>(
+        reinterpret_cast<char*>(shared_dest) + 
+        (threadIdx.x * MEMORY_ALIGNMENT) % (HBM_BANK_SIZE * sizeof(scalar_t))
+    );
     
     #pragma unroll
     for (int i = 0; i < size / 4; i++) {
         dest_vec4[i] = src_vec4[i * stride / 4];
     }
     
-    // Handle remaining elements
+    // Handle remaining elements with aligned access
     for (int i = (size / 4) * 4; i < size; i++) {
         shared_dest[i] = global_src[offset + i * stride];
+    }
+}
+
+// Warp-level reduction utilities optimized for tensor cores
+template<typename scalar_t>
+__device__ inline scalar_t warp_reduce_sum(scalar_t val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+// Block-level reduction with tensor core alignment
+template<typename scalar_t>
+__device__ inline void block_reduce_sum(
+    scalar_t* shared_mem,
+    scalar_t thread_sum,
+    int tid
+) {
+    // First warp-level reduction
+    thread_sum = warp_reduce_sum(thread_sum);
+    
+    // Store to shared memory
+    if (tid % WARP_SIZE == 0) {
+        shared_mem[tid / WARP_SIZE] = thread_sum;
+    }
+    
+    __syncthreads();
+    
+    // Final reduction in first warp
+    if (tid < WARP_SIZE) {
+        thread_sum = (tid < blockDim.x / WARP_SIZE) ? shared_mem[tid] : 0;
+        thread_sum = warp_reduce_sum(thread_sum);
     }
 }
 

@@ -40,6 +40,8 @@ class NSAttention(nn.Module):
         window_size: int = 512,
         gqa_groups: int = 4,
         dropout: float = 0.1,
+        use_fp8_kv_cache: bool = True,
+        gradient_checkpointing: bool = True,
     ):
         super().__init__()
         assert n_heads % gqa_groups == 0, "Number of heads must be divisible by GQA groups"
@@ -52,6 +54,8 @@ class NSAttention(nn.Module):
         self.top_blocks = top_blocks
         self.window_size = window_size
         self.gqa_groups = gqa_groups
+        self.use_fp8_kv_cache = use_fp8_kv_cache
+        self.gradient_checkpointing = gradient_checkpointing
         
         # Projection matrices
         self.q_proj = nn.Linear(d_model, d_model)
@@ -71,6 +75,11 @@ class NSAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.scale = self.head_dim ** -0.5
         
+        # FP8 scaling factors for KV cache quantization
+        if use_fp8_kv_cache:
+            self.register_buffer('k_scale', torch.ones(1))
+            self.register_buffer('v_scale', torch.ones(1))
+            
     def _reshape_heads(self, x: torch.Tensor, is_key_value: bool = False) -> torch.Tensor:
         batch, seq_len, _ = x.shape
         if is_key_value:
@@ -200,6 +209,20 @@ class NSAttention(nn.Module):
             
         return output
     
+    def _quantize_kv(self, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.use_fp8_kv_cache or not k.requires_grad:
+            return k, v
+            
+        # Dynamic quantization to FP8
+        with torch.no_grad():
+            self.k_scale = torch.max(torch.abs(k)).clamp(min=1e-5)
+            self.v_scale = torch.max(torch.abs(v)).clamp(min=1e-5)
+            
+        k_q = torch.quantize_per_tensor(k / self.k_scale, 1.0, 0, torch.float8_e4m3fn)
+        v_q = torch.quantize_per_tensor(v / self.v_scale, 1.0, 0, torch.float8_e4m3fn)
+        
+        return k_q * self.k_scale, v_q * self.v_scale
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -207,29 +230,45 @@ class NSAttention(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_length, _ = hidden_states.shape
         
-        # Project queries, keys, and values
-        q = self._reshape_heads(self.q_proj(hidden_states))
-        k = self._reshape_heads(self.k_proj(hidden_states), is_key_value=True)
-        v = self._reshape_heads(self.v_proj(hidden_states), is_key_value=True)
-        
-        # Compute attention for each branch
-        compression_out = self._compression_branch(q, k, v, attention_mask)
-        selection_out = self._selection_branch(q, k, v, attention_mask)
-        window_out = self._window_branch(q, k, v, attention_mask)
-        
-        # Compute gating weights
-        gates = self.gate_mlp(hidden_states)  # [batch, seq, 3]
-        g_cmp, g_slc, g_win = gates.chunk(3, dim=-1)
-        
-        # Combine branch outputs with gating
-        combined = (
-            g_cmp.unsqueeze(1) * compression_out +
-            g_slc.unsqueeze(1) * selection_out +
-            g_win.unsqueeze(1) * window_out
-        )
-        
-        # Reshape and project output
-        combined = combined.transpose(1, 2).contiguous()
-        combined = combined.view(batch_size, seq_length, self.d_model)
-        
-        return self.o_proj(combined) 
+        # Use automatic mixed precision
+        with torch.cuda.amp.autocast(enabled=True):
+            # Project queries, keys, and values
+            q = self._reshape_heads(self.q_proj(hidden_states))
+            k = self._reshape_heads(self.k_proj(hidden_states), is_key_value=True)
+            v = self._reshape_heads(self.v_proj(hidden_states), is_key_value=True)
+            
+            # Quantize KV cache if enabled
+            k, v = self._quantize_kv(k, v)
+            
+            # Use gradient checkpointing for memory efficiency
+            if self.gradient_checkpointing and self.training:
+                compression_out = torch.utils.checkpoint.checkpoint(
+                    self._compression_branch, q, k, v, attention_mask
+                )
+                selection_out = torch.utils.checkpoint.checkpoint(
+                    self._selection_branch, q, k, v, attention_mask
+                )
+                window_out = torch.utils.checkpoint.checkpoint(
+                    self._window_branch, q, k, v, attention_mask
+                )
+            else:
+                compression_out = self._compression_branch(q, k, v, attention_mask)
+                selection_out = self._selection_branch(q, k, v, attention_mask)
+                window_out = self._window_branch(q, k, v, attention_mask)
+            
+            # Compute gating weights
+            gates = self.gate_mlp(hidden_states)  # [batch, seq, 3]
+            g_cmp, g_slc, g_win = gates.chunk(3, dim=-1)
+            
+            # Combine branch outputs with gating
+            combined = (
+                g_cmp.unsqueeze(1) * compression_out +
+                g_slc.unsqueeze(1) * selection_out +
+                g_win.unsqueeze(1) * window_out
+            )
+            
+            # Reshape and project output
+            combined = combined.transpose(1, 2).contiguous()
+            combined = combined.view(batch_size, seq_length, self.d_model)
+            
+            return self.o_proj(combined) 
