@@ -14,6 +14,11 @@ constexpr int MAX_SHARED_MEMORY = 48 * 1024;  // 48KB shared memory per block
 constexpr int L2_CACHE_LINE_SIZE = 128;       // L2 cache line size for coalescing
 constexpr int HBM_BANK_SIZE = 256;            // HBM bank size for bank conflict avoidance
 
+// 2D spatial attention constants
+constexpr int MAX_SPATIAL_WINDOW = 49;  // 7x7 window
+constexpr int MAX_SPATIAL_BLOCKS = 196;  // For 224x224 image with 16x16 blocks
+constexpr int MIN_BLOCKS_PER_SM = 2;    // Minimum blocks per SM for occupancy
+
 // Tensor Core optimization constants
 constexpr int BLOCK_SIZE_M = 64;  // Tensor Core friendly sizes
 constexpr int BLOCK_SIZE_N = 64;
@@ -373,4 +378,140 @@ __global__ void compute_attention_output_kernel(
                 *reinterpret_cast<float4*>(&acc[d]);
         }
     }
+}
+
+// 2D spatial coordinates helper
+struct SpatialCoords {
+    int h, w, H, W;
+    
+    __device__ inline int to_linear_idx() const {
+        return h * W + w;
+    }
+    
+    __device__ inline bool in_window(const SpatialCoords& other, int window_size) const {
+        int dh = abs(h - other.h);
+        int dw = abs(w - other.w);
+        return dh <= window_size/2 && dw <= window_size/2;
+    }
+    
+    __device__ inline bool valid() const {
+        return h >= 0 && h < H && w >= 0 && w < W;
+    }
+};
+
+// 2D block helper
+struct BlockCoords {
+    int bh, bw, block_size;
+    
+    __device__ inline SpatialCoords to_spatial(int idx_h, int idx_w) const {
+        return {
+            bh * block_size + idx_h,
+            bw * block_size + idx_w,
+            block_size,
+            block_size
+        };
+    }
+};
+
+// Helper functions for grid/block dimensions with 2D support
+inline dim3 get_grid_dim_2d(
+    int batch_size,
+    int num_heads,
+    int height,
+    int width,
+    int block_size
+) {
+    const int blocks_h = (height + block_size - 1) / block_size;
+    const int blocks_w = (width + block_size - 1) / block_size;
+    return dim3(batch_size, num_heads, blocks_h * blocks_w);
+}
+
+// Compute optimal block dimensions with warp and tensor core alignment
+inline dim3 get_block_dim_2d(int block_size) {
+    // For 2D, we want multiple warps to handle each spatial block
+    const int warps_per_block = min(4, (block_size * block_size + WARP_SIZE - 1) / WARP_SIZE);
+    return dim3(warps_per_block * WARP_SIZE);
+}
+
+// Shared memory utilities with mixed precision and 2D support
+template<typename T>
+struct SharedMemory2D {
+    __device__ inline T* get(int window_size) {
+        extern __shared__ unsigned char memory[] __align__(MEMORY_ALIGNMENT);
+        // Add padding for both height and width dimensions
+        const int padding = TypeInfo<T>::is_fp16 || TypeInfo<T>::is_bf16 ? 2 : 1;
+        return reinterpret_cast<T*>(memory) + 
+               (threadIdx.x % (HBM_BANK_SIZE / sizeof(T))) +
+               (window_size * window_size * padding);
+    }
+};
+
+// Optimized 2D memory loading with vectorized access
+template<typename scalar_t>
+__device__ inline void load_2d_block_to_shared(
+    scalar_t* shared_dest,
+    const scalar_t* global_src,
+    const BlockCoords& coords,
+    int height,
+    int width,
+    int stride
+) {
+    const int tid = threadIdx.x;
+    const int block_size = coords.block_size;
+    const int block_area = block_size * block_size;
+    
+    // Each thread loads multiple elements using vectorized access
+    if constexpr (TypeInfo<scalar_t>::is_fp16 || TypeInfo<scalar_t>::is_bf16) {
+        using Vec2 = typename std::aligned_storage<sizeof(scalar_t[2]), alignof(scalar_t[2])>::type;
+        
+        for (int idx = tid * 2; idx < block_area; idx += blockDim.x * 2) {
+            const int h = idx / block_size;
+            const int w = idx % block_size;
+            const int gh = coords.bh * block_size + h;
+            const int gw = coords.bw * block_size + w;
+            
+            if (gh < height && gw < width) {
+                const Vec2* src_vec2 = reinterpret_cast<const Vec2*>(
+                    &global_src[(gh * width + gw) * stride]
+                );
+                Vec2* dst_vec2 = reinterpret_cast<Vec2*>(
+                    &shared_dest[h * block_size + w]
+                );
+                *dst_vec2 = *src_vec2;
+            }
+        }
+    } else {
+        using Vec4 = typename std::aligned_storage<sizeof(scalar_t[4]), alignof(scalar_t[4])>::type;
+        
+        for (int idx = tid * 4; idx < block_area; idx += blockDim.x * 4) {
+            const int h = idx / block_size;
+            const int w = idx % block_size;
+            const int gh = coords.bh * block_size + h;
+            const int gw = coords.bw * block_size + w;
+            
+            if (gh < height && gw < width) {
+                const Vec4* src_vec4 = reinterpret_cast<const Vec4*>(
+                    &global_src[(gh * width + gw) * stride]
+                );
+                Vec4* dst_vec4 = reinterpret_cast<Vec4*>(
+                    &shared_dest[h * block_size + w]
+                );
+                *dst_vec4 = *src_vec4;
+            }
+        }
+    }
+}
+
+// Compute relative position encoding indices for 2D attention
+__device__ inline void compute_2d_rel_pos_indices(
+    int* rel_pos_h,
+    int* rel_pos_w,
+    const SpatialCoords& q_pos,
+    const SpatialCoords& k_pos,
+    int spatial_window
+) {
+    const int dh = k_pos.h - q_pos.h + spatial_window - 1;
+    const int dw = k_pos.w - q_pos.w + spatial_window - 1;
+    *rel_pos_h = min(max(dh, 0), 2 * spatial_window - 2);
+    *rel_pos_w = min(max(dw, 0), 2 * spatial_window - 2);
 } 
