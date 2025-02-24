@@ -20,7 +20,7 @@ accelerate>=0.25.0
 tensorboard>=2.15.0
 
 # Optimization
-flash-attn>=2.3.3
+# flash-attn>=2.3.3
 triton>=2.1.0
 bitsandbytes>=0.41.0
 

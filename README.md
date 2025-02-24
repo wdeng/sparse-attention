@@ -37,6 +37,7 @@ conda activate nsa
 3. Install dependencies:
 ```bash
 pip install -r requirements.txt
+uv pip install flash-attn --no-build-isolation
 ```
 
 4. Build CUDA extensions:
